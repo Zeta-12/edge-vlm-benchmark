@@ -71,6 +71,53 @@ def cmd_matrix(args) -> None:
         args.out.write_text(table + "\n", encoding="utf-8")
 
 
+def cmd_data(args) -> None:
+    from edge_vlm import data
+
+    for task in args.task:
+        root = data.download(task)
+        print(task, len(data.load(task, root)), "samples in", root)
+
+
+def eval_path(out: Path, model_dir: Path, device: str, task: str, n: int | None, seed: int) -> Path:
+    size = "all" if n is None else f"n{n}"
+    return out / model_dir.parent.name / model_dir.name / device / f"{task}_{size}_s{seed}.jsonl"
+
+
+def cmd_eval(args) -> None:
+    from edge_vlm import data, evaluate, metrics
+
+    samples = data.subset(data.load(args.task), args.n, args.seed, data.STRATIFY.get(args.task))
+    for device in args.devices:
+        out = eval_path(args.out, args.model_dir, device, args.task, args.n, args.seed)
+        evaluate.run(args.model_dir, device, args.task, samples, out)
+        res = metrics.score(args.task, evaluate.read_records(out))
+        out.with_suffix(".json").write_text(json.dumps(res, indent=2), encoding="utf-8")
+        logging.info("%s %s: %s", out.parent, args.task, {k: v for k, v in res.items() if k != "by_category"})
+
+
+def cmd_score(args) -> None:
+    from edge_vlm import evaluate, metrics
+
+    for path in args.jsonl:
+        task = path.name.split("_")[0]
+        res = metrics.score(task, evaluate.read_records(path))
+        path.with_suffix(".json").write_text(json.dumps(res, indent=2), encoding="utf-8")
+        print(path, json.dumps({k: v for k, v in res.items() if k != "by_category"}))
+
+
+def cmd_compare(args) -> None:
+    from edge_vlm.compare import agreement
+
+    res = agreement(args.a, args.b)
+    n = res["n"]
+    print(f"{n} common samples")
+    for key in ("same_text", "same_normalized", "same_input_tokens"):
+        print(f"  {key}: {res[key]}/{n}")
+    for i, pa, pb in res["differences"]:
+        print(f"  {i}: {pa!r} vs {pb!r}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="evb", description="Small VLMs on CPU / iGPU / NPU with OpenVINO GenAI.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -101,6 +148,29 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("probe_dir", type=Path, nargs="?", default=Path("runs/probe"))
     s.add_argument("--out", type=Path)
     s.set_defaults(func=cmd_matrix)
+
+    tasks = ("textvqa", "pope", "mmstar")
+    s = sub.add_parser("data", help="download the benchmark datasets (pinned revisions)")
+    s.add_argument("task", nargs="*", choices=tasks, default=list(tasks))
+    s.set_defaults(func=cmd_data)
+
+    s = sub.add_parser("eval", help="run a model on a task subset and score it")
+    s.add_argument("model_dir", type=Path)
+    s.add_argument("--task", required=True, choices=tasks)
+    s.add_argument("--devices", nargs="+", default=["GPU"])
+    s.add_argument("--n", type=int, help="subset size, default: whole set")
+    s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--out", type=Path, default=Path("runs/eval"))
+    s.set_defaults(func=cmd_eval)
+
+    s = sub.add_parser("score", help="rescore eval jsonl files")
+    s.add_argument("jsonl", type=Path, nargs="+")
+    s.set_defaults(func=cmd_score)
+
+    s = sub.add_parser("compare", help="sample by sample agreement of two eval jsonl files")
+    s.add_argument("a", type=Path)
+    s.add_argument("b", type=Path)
+    s.set_defaults(func=cmd_compare)
     return p
 
 
