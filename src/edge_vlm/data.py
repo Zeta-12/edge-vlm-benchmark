@@ -47,10 +47,28 @@ class Sample:
     def prompt(self) -> str:
         return PROMPTS[self.meta["task"]].format(question=self.question)
 
-    def pil(self):
+    def pil(self, max_pixels: int | None = None):
         from PIL import Image
 
-        return Image.open(io.BytesIO(self.image)).convert("RGB")
+        img = Image.open(io.BytesIO(self.image)).convert("RGB")
+        return cap_pixels(img, MAX_PIXELS if max_pixels is None else max_pixels)
+
+
+# 1280 * 28 * 28, the cap the Qwen2-VL / Qwen2.5-VL README suggests to bound memory. The processor
+# default (12.8 MP) lets one big image turn into 5000+ visual tokens and several GB of activations.
+MAX_PIXELS = 1280 * 28 * 28
+
+
+def cap_pixels(img, max_pixels: int):
+    """Downscale (keeping the aspect ratio) so that width * height <= max_pixels."""
+    from PIL import Image
+
+    w, h = img.size
+    if max_pixels <= 0 or w * h <= max_pixels:
+        return img
+    scale = (max_pixels / (w * h)) ** 0.5
+    size = (max(1, int(w * scale)), max(1, int(h * scale)))
+    return img.resize(size, Image.Resampling.BICUBIC)
 
 
 def local(task: str) -> Path | None:

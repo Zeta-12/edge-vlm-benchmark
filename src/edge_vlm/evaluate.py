@@ -6,6 +6,7 @@ it stopped.
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import time
@@ -28,11 +29,11 @@ def read_records(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def to_tensor(sample: Sample):
+def to_tensor(img):
     import numpy as np
     import openvino as ov
 
-    return ov.Tensor(np.asarray(sample.pil(), dtype=np.uint8)[None])
+    return ov.Tensor(np.asarray(img, dtype=np.uint8)[None])
 
 
 def _mean(v):
@@ -59,7 +60,20 @@ def memory_mb() -> dict:
     }
 
 
-def run(model_dir: Path, device: str, task: str, samples: list[Sample], out: Path, config: dict | None = None) -> Path:
+# the GPU plugin keeps kernels / buffers for every new input shape, so memory creeps up
+# by a few MB per image; a fresh pipeline every RELOAD_EVERY samples keeps it bounded
+RELOAD_EVERY = 100
+
+
+def run(
+    model_dir: Path,
+    device: str,
+    task: str,
+    samples: list[Sample],
+    out: Path,
+    config: dict | None = None,
+    reload_every: int = RELOAD_EVERY,
+) -> Path:
     import openvino_genai as ov_genai
 
     todo = [s for s in samples if s.id not in done_ids(out)]
@@ -67,9 +81,6 @@ def run(model_dir: Path, device: str, task: str, samples: list[Sample], out: Pat
         log.info("%s: nothing to do", out)
         return out
     out.parent.mkdir(parents=True, exist_ok=True)
-    t0 = time.perf_counter()
-    pipe = ov_genai.VLMPipeline(str(model_dir), device, **(config or {}))
-    log.info("%s on %s loaded in %.1f s, %d samples to go", model_dir, device, time.perf_counter() - t0, len(todo))
 
     cfg = ov_genai.GenerationConfig()
     cfg.max_new_tokens = MAX_NEW_TOKENS[task]
@@ -78,19 +89,28 @@ def run(model_dir: Path, device: str, task: str, samples: list[Sample], out: Pat
     keep_awake(True)
     t_start = time.perf_counter()
     try:
-        _loop(pipe, cfg, todo, out, t_start)
+        for start in range(0, len(todo), reload_every or len(todo)):
+            t0 = time.perf_counter()
+            pipe = ov_genai.VLMPipeline(str(model_dir), device, **(config or {}))
+            load_s = time.perf_counter() - t0
+            log.info("%s on %s loaded in %.1f s, %d samples to go", model_dir, device, load_s, len(todo) - start)
+            _loop(pipe, cfg, todo, start, reload_every or len(todo), out, t_start)
+            del pipe
+            gc.collect()
     finally:
         keep_awake(False)
     return out
 
 
-def _loop(pipe, cfg, todo: list[Sample], out: Path, t_start: float) -> None:
+def _loop(pipe, cfg, todo: list[Sample], start: int, count: int, out: Path, t_start: float) -> None:
     with open(out, "a", encoding="utf-8") as f:
-        for i, s in enumerate(todo, 1):
-            res = pipe.generate(s.prompt, images=[to_tensor(s)], generation_config=cfg)
+        for i, s in enumerate(todo[start : start + count], start + 1):
+            img = s.pil()
+            res = pipe.generate(s.prompt, images=[to_tensor(img)], generation_config=cfg)
             pm = res.perf_metrics
             rec = {
                 "id": s.id,
+                "image": list(img.size),
                 "pred": res.texts[0],
                 "answers": s.answers,
                 "meta": s.meta,

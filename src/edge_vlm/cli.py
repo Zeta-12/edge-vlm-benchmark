@@ -92,6 +92,7 @@ def cmd_eval(args) -> None:
         out = eval_path(args.out, args.model_dir, device, args.task, args.n, args.seed)
         evaluate.run(args.model_dir, device, args.task, samples, out)
         res = metrics.score(args.task, evaluate.read_records(out))
+        res["max_pixels"] = data.MAX_PIXELS
         out.with_suffix(".json").write_text(json.dumps(res, indent=2), encoding="utf-8")
         logging.info("%s %s: %s", out.parent, args.task, {k: v for k, v in res.items() if k != "by_category"})
 

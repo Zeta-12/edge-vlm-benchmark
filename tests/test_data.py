@@ -55,3 +55,17 @@ def test_compare_agreement(tmp_path):
     res = agreement(a, b)
     assert (res["n"], res["same_text"], res["same_normalized"], res["same_input_tokens"]) == (3, 1, 2, 2)
     assert res["differences"] == [("2", "12", "13")]
+
+
+def test_cap_pixels_keeps_aspect_and_small_images():
+    from PIL import Image
+
+    from edge_vlm.data import MAX_PIXELS, cap_pixels
+
+    small = Image.new("RGB", (1024, 768))
+    assert cap_pixels(small, MAX_PIXELS) is small
+    big = cap_pixels(Image.new("RGB", (4000, 3000)), MAX_PIXELS)
+    w, h = big.size
+    assert w * h <= MAX_PIXELS
+    assert abs(w / h - 4 / 3) < 0.01
+    assert w * h > 0.99 * MAX_PIXELS

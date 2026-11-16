@@ -31,13 +31,15 @@ def main(snapshot: str, task: str, n: str, out: str, seed: str = "0") -> None:
         for i, s in enumerate(todo, 1):
             messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": s.prompt}]}]
             text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-            inputs = processor(text=[text], images=[s.pil()], return_tensors="pt")
+            img = s.pil()
+            inputs = processor(text=[text], images=[img], return_tensors="pt")
             t0 = time.perf_counter()
             with torch.inference_mode():
                 ids = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS[task], do_sample=False)
             new = ids[:, inputs["input_ids"].shape[1] :]
             rec = {
                 "id": s.id,
+                "image": list(img.size),
                 "pred": processor.batch_decode(new, skip_special_tokens=True)[0],
                 "answers": s.answers,
                 "meta": s.meta,
