@@ -111,8 +111,10 @@ def load(task: str, root: Path | None = None) -> list[Sample]:
         if task == "textvqa":
             out.append(Sample(str(r["question_id"]), _image_bytes(r["image"]), r["question"], list(r["answers"]), {}))
         elif task == "pope":
+            # question_id restarts at 1 in each of the 3 categories
             meta = {"category": r["category"], "image_source": r["image_source"]}
-            out.append(Sample(str(r["question_id"]), _image_bytes(r["image"]), r["question"], [r["answer"]], meta))
+            qid = f"{r['category']}-{r['question_id']}"
+            out.append(Sample(qid, _image_bytes(r["image"]), r["question"], [r["answer"]], meta))
         elif task == "mmstar":
             meta = {"category": r["category"], "l2_category": r["l2_category"]}
             out.append(Sample(str(r["index"]), _image_bytes(r["image"]), r["question"], [r["answer"]], meta))

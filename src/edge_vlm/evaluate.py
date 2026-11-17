@@ -64,6 +64,10 @@ def memory_mb() -> dict:
 # by a few MB per image; a fresh pipeline every RELOAD_EVERY samples keeps it bounded
 RELOAD_EVERY = 100
 
+# the NPU compiles the LLM for a fixed max prompt length, 1024 by default, and a ~1 MP image
+# is already ~1000 tokens with Qwen3-VL. Prefill runs in chunks, so the larger bound is free.
+DEVICE_CONFIG = {"NPU": {"MAX_PROMPT_LEN": 2048}}
+
 
 def run(
     model_dir: Path,
@@ -85,13 +89,14 @@ def run(
     cfg = ov_genai.GenerationConfig()
     cfg.max_new_tokens = MAX_NEW_TOKENS[task]
     cfg.do_sample = False
+    config = {**DEVICE_CONFIG.get(device, {}), **(config or {})}
 
     keep_awake(True)
     t_start = time.perf_counter()
     try:
         for start in range(0, len(todo), reload_every or len(todo)):
             t0 = time.perf_counter()
-            pipe = ov_genai.VLMPipeline(str(model_dir), device, **(config or {}))
+            pipe = ov_genai.VLMPipeline(str(model_dir), device, **config)
             load_s = time.perf_counter() - t0
             log.info("%s on %s loaded in %.1f s, %d samples to go", model_dir, device, load_s, len(todo) - start)
             _loop(pipe, cfg, todo, start, reload_every or len(todo), out, t_start)

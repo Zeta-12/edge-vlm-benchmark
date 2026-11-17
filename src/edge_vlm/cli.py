@@ -26,40 +26,70 @@ def cmd_export(args) -> None:
         export(args.snapshot, args.out / args.name / fmt, fmt, args.python)
 
 
-def cmd_probe(args) -> None:
-    from edge_vlm.probe import make_sign
+def run_child(module: str, model_dir: Path, device: str, extra: list[str], out: Path, timeout: int) -> dict:
+    """`python -m module model_dir device *extra out` in its own process. If it dies
+    before writing out (driver crash, timeout), write a failure record instead."""
+    cmd = [sys.executable, "-m", module, str(model_dir), device, *extra, str(out)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        error = f"process exited with {proc.returncode}: {(proc.stderr or proc.stdout)[-2000:]}"
+    except subprocess.TimeoutExpired:
+        error = f"timeout after {timeout} s"
+    if not out.is_file():
+        rec = {"model": model_dir.parent.name, "format": model_dir.name, "device": device, "ok": False}
+        out.write_text(json.dumps({**rec, "error": error}, indent=2), encoding="utf-8")
+    return json.loads(out.read_text(encoding="utf-8"))
 
+
+def todo(args):
+    """(model_dir, device, out json) for each config without a record yet (all with --force)."""
     args.out.mkdir(parents=True, exist_ok=True)
-    if args.image is None:
-        args.image = make_sign(args.out / "sign.png")
     for model_dir in args.model_dir:
         for device in args.devices:
             out = args.out / f"{model_dir.parent.name}_{model_dir.name}_{device}.json"
             if out.is_file() and not args.force:
                 logging.info("skip %s (exists)", out.name)
                 continue
-            cmd = [sys.executable, "-m", "edge_vlm.probe", str(model_dir), device, str(args.image), args.prompt]
-            cmd.append(str(out))
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
-            if not out.is_file():  # hard crash, the child had no chance to write
-                tail = (proc.stderr or proc.stdout)[-2000:]
-                rec = {"model": model_dir.parent.name, "format": model_dir.name, "device": device, "ok": False}
-                rec["error"] = f"process exited with {proc.returncode}: {tail}"
-                out.write_text(json.dumps(rec, indent=2), encoding="utf-8")
-            rec = json.loads(out.read_text(encoding="utf-8"))
-            name = f"{rec['model']} {rec['format']} {device}"
-            if rec["ok"]:
-                logging.info(
-                    "%s: load %.1f s, ttft %.0f ms, %.1f tok/s, %.0f MB, %r",
-                    name,
-                    rec["load_s"],
-                    rec["ttft_ms"],
-                    rec["tok_per_s"],
-                    rec["peak_rss_mb"],
-                    rec["text"][:80],
-                )
-            else:
-                logging.info("%s: FAILED %s", name, rec["error"][:300])
+            yield model_dir, device, out
+
+
+def cmd_probe(args) -> None:
+    from edge_vlm.probe import make_sign
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    if args.image is None:
+        args.image = make_sign(args.out / "sign.png")
+    for model_dir, device, out in todo(args):
+        rec = run_child("edge_vlm.probe", model_dir, device, [str(args.image), args.prompt], out, args.timeout)
+        name = f"{rec['model']} {rec['format']} {device}"
+        if rec["ok"]:
+            logging.info(
+                "%s: load %.1f s, ttft %.0f ms, %.1f tok/s, %.0f MB, %r",
+                name,
+                rec["load_s"],
+                rec["ttft_ms"],
+                rec["tok_per_s"],
+                rec["peak_rss_mb"],
+                rec["text"][:80],
+            )
+        else:
+            logging.info("%s: FAILED %s", name, rec["error"][:300])
+
+
+def cmd_latency(args) -> None:
+    from edge_vlm import latency
+
+    for model_dir, device, out in todo(args):
+        rec = run_child("edge_vlm.latency", model_dir, device, [], out, args.timeout)
+        name = f"{rec['model']} {rec['format']} {device}"
+        if rec["ok"]:
+            ttft = ", ".join(f"{p['ttft_ms']:.0f}" for p in rec["prefill"])
+            logging.info("%s: ttft %s ms, %.1f tok/s", name, ttft, rec["decode"]["tok_per_s"])
+        else:
+            logging.info("%s: FAILED %s", name, rec["error"][:300])
+    table = latency.markdown(latency.load(args.out))
+    (args.out / "latency.md").write_text(table + "\n", encoding="utf-8")
+    print(table)
 
 
 def cmd_matrix(args) -> None:
@@ -93,6 +123,7 @@ def cmd_eval(args) -> None:
         evaluate.run(args.model_dir, device, args.task, samples, out)
         res = metrics.score(args.task, evaluate.read_records(out))
         res["max_pixels"] = data.MAX_PIXELS
+        res["device_config"] = evaluate.DEVICE_CONFIG.get(device, {})
         out.with_suffix(".json").write_text(json.dumps(res, indent=2), encoding="utf-8")
         logging.info("%s %s: %s", out.parent, args.task, {k: v for k, v in res.items() if k != "by_category"})
 
@@ -105,6 +136,15 @@ def cmd_score(args) -> None:
         res = metrics.score(task, evaluate.read_records(path))
         path.with_suffix(".json").write_text(json.dumps(res, indent=2), encoding="utf-8")
         print(path, json.dumps({k: v for k, v in res.items() if k != "by_category"}))
+
+
+def cmd_report(args) -> None:
+    from edge_vlm import report
+
+    text = report.markdown(args.root)
+    print(text)
+    if args.out:
+        args.out.write_text(text + "\n", encoding="utf-8")
 
 
 def cmd_compare(args) -> None:
@@ -145,6 +185,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--force", action="store_true")
     s.set_defaults(func=cmd_probe)
 
+    s = sub.add_parser("latency", help="time to first token at fixed image sizes and decode speed")
+    s.add_argument("model_dir", type=Path, nargs="+")
+    s.add_argument("--devices", nargs="+", default=list(DEVICES))
+    s.add_argument("--out", type=Path, default=Path("runs/latency"))
+    s.add_argument("--timeout", type=int, default=3600)
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(func=cmd_latency)
+
     s = sub.add_parser("matrix", help="support matrix from the probe records")
     s.add_argument("probe_dir", type=Path, nargs="?", default=Path("runs/probe"))
     s.add_argument("--out", type=Path)
@@ -167,6 +215,11 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("score", help="rescore eval jsonl files")
     s.add_argument("jsonl", type=Path, nargs="+")
     s.set_defaults(func=cmd_score)
+
+    s = sub.add_parser("report", help="accuracy tables and paired differences from the eval runs")
+    s.add_argument("root", type=Path, nargs="?", default=Path("runs/eval"))
+    s.add_argument("--out", type=Path)
+    s.set_defaults(func=cmd_report)
 
     s = sub.add_parser("compare", help="sample by sample agreement of two eval jsonl files")
     s.add_argument("a", type=Path)
